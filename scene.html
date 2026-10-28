@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>驳接爪数字孪生</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #0f172a; color: #e2e8f0;
+                 font-family: "Microsoft YaHei", sans-serif; }
+    #hud {
+        position: fixed; top: 16px; left: 16px; z-index: 9; min-width: 230px;
+        background: rgba(15, 23, 42, .82); padding: 14px 16px; border-radius: 10px;
+        border: 1px solid #24344d; font-size: 12px; line-height: 1.9;
+    }
+    #hud .title { font-size: 14px; font-weight: 700; color: #f8fafc; margin-bottom: 6px; }
+    #hud .panel { color: #93c5fd; font-size: 13px; margin-bottom: 6px; }
+    #hud .row { display: flex; justify-content: space-between; gap: 18px; color: #94a3b8; }
+    #hud .row b { color: #e2e8f0; font-weight: 600; }
+    #hud .hint { margin-top: 8px; color: #64748b; font-size: 11px; }
+    #empty {
+        position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+        color: #64748b; font-size: 14px; z-index: 5; pointer-events: none;
+    }
+    #error {
+        position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+        color: #f87171; font-size: 15px; text-align: center; line-height: 1.8; z-index: 99;
+    }
+</style>
+</head>
+<body>
+<div id="hud">
+    <div class="title">驳接爪数字孪生</div>
+    <div class="panel" id="panelName">等待模型</div>
+    <div class="row"><span>分格尺寸</span><b id="panelSize">—</b></div>
+    <div class="row"><span>节点数量</span><b id="nodeCount">0</b></div>
+    <div class="row"><span>受力阈值</span><b id="threshold">120</b><span>kN</span></div>
+    <div class="row"><span>最大受力</span><b id="maxForce">—</b><span>kN</span></div>
+    <div class="hint">鼠标拖动旋转 ｜ 滚轮缩放</div>
+</div>
+<div id="empty">等待模型数据…</div>
+<div id="error">three.js 加载失败<br>请确认软件目录下存在 three.js 文件</div>
+
+<script src="three.js"></script>
+<script>
+const SCALE = 0.1;
+let scene, camera, renderer, root, panelMesh;
+let threshold = 120;
+let autoRotate = true;
+let dragging = false, lastX = 0, lastY = 0;
+let rotY = 0.35, rotX = -0.12;
+let armMaterials = [];
+
+function setText(id, text) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+}
+
+function forceColor(value) {
+    const ratio = Math.max(0, Math.min(1, Math.abs(Number(value) || 0) / Math.max(threshold, 1)));
+    const color = new THREE.Color();
+    color.setRGB(0.62 + ratio * 0.30, 0.70 - ratio * 0.52, 0.82 - ratio * 0.70);
+    return color;
+}
+
+function makeLabel(text, color) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    ctx.font = 'bold 30px "Microsoft YaHei", sans-serif';
+    ctx.fillStyle = color || '#dbeafe';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, 128, 32);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.minFilter = THREE.LinearFilter;
+    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(material);
+    sprite.scale.set(48, 12, 1);
+    return sprite;
+}
+
+function init() {
+    if (!window.THREE) {
+        document.getElementById('error').style.display = 'flex';
+        return;
+    }
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0f172a);
+    scene.fog = new THREE.Fog(0x0f172a, 900, 2200);
+
+    camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 8000);
+    camera.position.set(0, -160, 520);
+    camera.lookAt(0, 0, 0);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0x8899bb, 1.15));
+    const key = new THREE.DirectionalLight(0xffffff, 1.35);
+    key.position.set(420, -620, 780);
+    scene.add(key);
+    const rim = new THREE.DirectionalLight(0x5b8cff, 0.6);
+    rim.position.set(-520, 420, 360);
+    scene.add(rim);
+
+    const grid = new THREE.GridHelper(1200, 24, 0x24344d, 0x1a2740);
+    grid.position.set(0, 0, -120);
+    grid.rotation.x = Math.PI / 2;
+    scene.add(grid);
+
+    root = new THREE.Group();
+    scene.add(root);
+
+    bindMouse();
+    window.addEventListener('resize', onResize);
+    animate();
+}
+
+function disposeObject(obj) {
+    obj.traverse(function (child) {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+            if (child.material.map) child.material.map.dispose();
+            child.material.dispose();
+        }
+    });
+}
+
+function clearRoot() {
+    while (root.children.length) {
+        const child = root.children[0];
+        root.remove(child);
+        disposeObject(child);
+    }
+    armMaterials = [];
+    panelMesh = null;
+}
+
+function setModel(model) {
+    if (!root) return;
+    clearRoot();
+    model = model || {};
+    const panel = model.panel || {};
+    threshold = Number(model.threshold) || 120;
+    const width = Number(panel.width) || 1500;
+    const height = Number(panel.height) || 1800;
+    const thickness = Math.max(5, (Number(panel.thickness) || 12) * SCALE);
+    const pw = width * SCALE;
+    const ph = height * SCALE;
+
+    const glassMaterial = new THREE.MeshStandardMaterial({
+        color: 0x8fc4e8, transparent: true, opacity: 0.20,
+        metalness: 0.25, roughness: 0.08, side: THREE.DoubleSide
+    });
+    panelMesh = new THREE.Mesh(new THREE.BoxGeometry(pw, ph, thickness), glassMaterial);
+    panelMesh.position.z = -thickness;
+    root.add(panelMesh);
+
+    const edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(panelMesh.geometry),
+        new THREE.LineBasicMaterial({ color: 0x60a5fa, transparent: true, opacity: 0.65 })
+    );
+    edges.position.copy(panelMesh.position);
+    root.add(edges);
+
+    const nodes = model.nodes || [];
+    let maxForce = 0;
+    nodes.forEach(function (node) {
+        const x = Number(node.x || 0) * SCALE;
+        const y = Number(node.y || 0) * SCALE;
+        const mainForce = Number(node.force || 0);
+        maxForce = Math.max(maxForce, Math.abs(mainForce));
+        const forces = node.forces || [];
+        const arms = Math.max(1, Number(node.arms || 4));
+        const armLength = 36;
+
+        const hub = new THREE.Mesh(
+            new THREE.CylinderGeometry(9, 9, 16, 24),
+            new THREE.MeshStandardMaterial({ color: 0xaab4c0, metalness: 0.85, roughness: 0.22 })
+        );
+        hub.rotation.x = Math.PI / 2;
+        hub.position.set(x, y, 6);
+        root.add(hub);
+
+        for (let i = 0; i < arms; i++) {
+            const angle = (i / arms) * Math.PI * 2 + Math.PI / 4;
+            const armForce = i < forces.length ? Number(forces[i]) : mainForce;
+            const material = new THREE.MeshStandardMaterial({
+                color: forceColor(armForce), metalness: 0.6, roughness: 0.3
+            });
+            const arm = new THREE.Mesh(new THREE.BoxGeometry(armLength, 5, 5), material);
+            arm.position.set(x + Math.cos(angle) * armLength / 2,
+                             y + Math.sin(angle) * armLength / 2, 10);
+            arm.rotation.z = angle;
+            root.add(arm);
+            armMaterials.push(material);
+
+            const cap = new THREE.Mesh(
+                new THREE.SphereGeometry(5.5, 16, 12),
+                new THREE.MeshStandardMaterial({ color: forceColor(armForce), metalness: 0.5, roughness: 0.3 })
+            );
+            cap.position.set(x + Math.cos(angle) * armLength,
+                             y + Math.sin(angle) * armLength, 10);
+            root.add(cap);
+        }
+
+        const label = makeLabel(node.label || 'J', mainForce > threshold ? '#fca5a5' : '#dbeafe');
+        label.position.set(x, y + 18, 36);
+        root.add(label);
+    });
+
+    const dist = Math.max(pw, ph) * 1.9 + 180;
+    camera.position.set(0, -dist * 0.22, dist * 0.92);
+    camera.lookAt(0, 0, 0);
+
+    setText('panelName', panel.no || '未命名分格');
+    setText('panelSize', Math.round(width) + ' × ' + Math.round(height) + ' × ' + (panel.thickness || 12) + ' mm');
+    setText('nodeCount', String(nodes.length));
+    setText('threshold', String(threshold));
+    setText('maxForce', maxForce ? maxForce.toFixed(1) : '—');
+    document.getElementById('empty').style.display = nodes.length ? 'none' : 'flex';
+}
+
+function updateClawForce(forceArray, thr) {
+    if (typeof thr === 'number' && isFinite(thr) && thr > 0) threshold = thr;
+    if (!armMaterials.length) return;
+    const n = Math.min(armMaterials.length, forceArray.length);
+    let maxForce = 0;
+    for (let i = 0; i < n; i++) {
+        const value = Number(forceArray[i]) || 0;
+        maxForce = Math.max(maxForce, Math.abs(value));
+        armMaterials[i].color.copy(forceColor(value));
+    }
+    setText('maxForce', maxForce ? maxForce.toFixed(1) : '—');
+}
+
+function resetModel() {
+    if (!root) return;
+    clearRoot();
+    setText('panelName', '等待模型');
+    setText('panelSize', '—');
+    setText('nodeCount', '0');
+    setText('maxForce', '—');
+    document.getElementById('empty').style.display = 'flex';
+}
+
+function setForceThreshold(value) {
+    const v = Number(value);
+    if (isFinite(v) && v > 0) {
+        threshold = v;
+        setText('threshold', String(v));
+    }
+}
+
+function bindMouse() {
+    const canvas = renderer.domElement;
+    canvas.addEventListener('mousedown', function (e) {
+        dragging = true; lastX = e.clientX; lastY = e.clientY; autoRotate = false;
+    });
+    window.addEventListener('mouseup', function () { dragging = false; });
+    window.addEventListener('mousemove', function (e) {
+        if (!dragging) return;
+        rotY += (e.clientX - lastX) * 0.008;
+        rotX += (e.clientY - lastY) * 0.006;
+        rotX = Math.max(-1.1, Math.min(1.1, rotX));
+        lastX = e.clientX; lastY = e.clientY;
+    });
+    canvas.addEventListener('wheel', function (e) {
+        e.preventDefault();
+        const factor = e.deltaY > 0 ? 1.08 : 0.92;
+        camera.position.x *= factor;
+        camera.position.y *= factor;
+        camera.position.z *= factor;
+        camera.lookAt(0, 0, 0);
+    }, { passive: false });
+}
+
+function onResize() {
+    if (!renderer) return;
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    if (!renderer) return;
+    if (root) {
+        if (autoRotate && !dragging) rotY += 0.0012;
+        root.rotation.z = rotY;
+        root.rotation.x = rotX * 0.4;
+    }
+    renderer.render(scene, camera);
+}
+
+window.setModel = setModel;
+window.resetModel = resetModel;
+window.updateClawForce = updateClawForce;
+window.setForceThreshold = setForceThreshold;
+window.resetClawColor = resetModel;
+
+if (window.THREE) {
+    init();
+} else {
+    document.getElementById('error').style.display = 'flex';
+}
+</script>
+</body>
+</html>
